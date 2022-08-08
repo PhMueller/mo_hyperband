@@ -82,7 +82,6 @@ class MOHB:
         self.runtime = []
         self.history = []
         self.start = None
-        self.cumulated_costs = 0
 
         # Dask variables
         if n_workers is None and client is None:
