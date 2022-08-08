@@ -13,8 +13,6 @@ from mo_hyperband.utils import SHBracketManager
 from mo_hyperband.utils import multi_obj_util
 from sklearn.preprocessing import normalize
 
-from pygmo import hypervolume
-
 _logger_props = {
     "format": "{time:YYYY-MM-DD HH:mm:ss.SSS} {level} {message}",
     "enqueue": True,
