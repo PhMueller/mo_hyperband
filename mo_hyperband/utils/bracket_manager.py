@@ -1,13 +1,5 @@
 import numpy as np
 from loguru import logger
-import sys
-
-logger.configure(handlers=[{"sink": sys.stdout, "level": "DEBUG"}])
-_logger_props = {
-    "format": "{time} {level} {message}",
-    "enqueue": True,
-    "rotation": "500 MB"
-}
 
 
 class SHBracketManager(object):

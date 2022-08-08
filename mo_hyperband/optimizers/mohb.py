@@ -13,11 +13,13 @@ from mo_hyperband.utils import SHBracketManager
 from mo_hyperband.utils import multi_obj_util
 from sklearn.preprocessing import normalize
 
-logger.configure(handlers=[{"sink": sys.stdout, "level": "DEBUG"}])
+from pygmo import hypervolume
+
 _logger_props = {
-    "format": "{time} {level} {message}",
+    "format": "{time:YYYY-MM-DD HH:mm:ss.SSS} {level} {message}",
     "enqueue": True,
-    "rotation": "500 MB"
+    "rotation": "500 MB",
+    "level": "INFO",
 }
 
 
@@ -54,7 +56,12 @@ class MOHB:
             self.budgets = self.max_budget * np.power(self.eta,
                                                       -np.linspace(start=self.max_SH_iter - 1,
                                                                    stop=0, num=self.max_SH_iter))
-            self.budgets = [budget.astype(np.int64) for budget in self.budgets]
+            import numbers
+            if isinstance(min_budget, numbers.Integral):
+                dtype = np.int64
+            else:
+                dtype = np.float64
+            self.budgets = [budget.astype(dtype) for budget in self.budgets]
 
         # Miscellaneous
         self.output_path = kwargs['output_path'] if 'output_path' in kwargs else './'
@@ -75,6 +82,7 @@ class MOHB:
         self.runtime = []
         self.history = []
         self.start = None
+        self.cumulated_costs = 0
 
         # Dask variables
         if n_workers is None and client is None:
@@ -464,6 +472,8 @@ class MOHB:
             budget = run_info["budget"]
             config = run_info["config"]
             bracket_id = run_info["bracket_id"]
+            self.cumulated_costs += cost
+
             logger.debug(f'run info:{run_info}')
             for bracket in self.active_brackets:
                 if bracket.bracket_id == bracket_id:
@@ -478,19 +488,21 @@ class MOHB:
         # remove processed future
         self.futures = np.delete(self.futures, [i for i, _ in done_list]).tolist()
 
-    def _is_run_budget_exhausted(self, fevals=None, brackets=None, total_cost=None):
+    def _is_run_budget_exhausted(self, fevals=None, brackets=None, total_cost=None, total_wallclock_cost=None):
         """ Checks if the DEHB run should be terminated or continued
         """
-        delimiters = [fevals, brackets, total_cost]
+        delimiters = [fevals, brackets, total_cost, total_wallclock_cost]
         delim_sum = sum(x is not None for x in delimiters)
         if delim_sum == 0:
             raise ValueError(
-                "Need one of 'fevals', 'brackets' or 'total_cost' as budget for DEHB to run."
+                "Need one of 'fevals', 'brackets', 'total_cost' or 'total_wallclock_cost' as budget for DEHB to run."
             )
+
         if fevals is not None:
             if len(self.traj) >= fevals:
                 return True
-        elif brackets is not None:
+
+        if brackets is not None:
             if self.iteration_counter >= brackets:
                 for bracket in self.active_brackets:
                     # waits for all brackets < iteration_counter to finish by collecting results
@@ -498,11 +510,17 @@ class MOHB:
                             not bracket.is_bracket_done():
                         return False
                 return True
-        else:
-            if time.time() - self.start >= total_cost:
+
+        if total_cost is not None:
+            if self.cumulated_costs >= total_cost:
                 return True
-            if len(self.runtime) > 0 and self.runtime[-1] - self.start >= total_cost:
+
+        if total_wallclock_cost is not None:
+            if time.time() - self.start >= total_wallclock_cost:
                 return True
+            if len(self.runtime) > 0 and self.runtime[-1] - self.start >= total_wallclock_cost:
+                return True
+
         return False
 
     def _save_incumbent(self, name=None):
@@ -534,21 +552,25 @@ class MOHB:
                 str(bracket)
             ))
 
-    def _verbosity_runtime(self, fevals, brackets, total_cost):
+    def _verbosity_runtime(self, fevals, brackets, total_cost, total_wallclock_cost):
+
         if fevals is not None:
-            remaining = (len(self.traj), fevals, "function evaluation(s) done")
-        elif brackets is not None:
+            self.logger.info(f"{len(self.traj)}/{fevals} function evaluation(s) done")
+
+        if brackets is not None:
             _suffix = "bracket(s) started; # active brackets: {}".format(len(self.active_brackets))
-            remaining = (self.iteration_counter + 1, brackets, _suffix)
+            self.logger.info(f"{self.iteration_counter + 1}/{brackets} {_suffix}")
+
+        elif total_cost is not None:
+            elapsed = np.format_float_positional(self.cumulated_costs, precision=2)
+            self.logger.info(f"{elapsed}/{total_cost} seconds elapsed")
+
         else:
             elapsed = np.format_float_positional(time.time() - self.start, precision=2)
-            remaining = (elapsed, total_cost, "seconds elapsed")
-        self.logger.info(
-            "{}/{} {}".format(remaining[0], remaining[1], remaining[2])
-        )
+            self.logger.info(f"{elapsed}/{total_wallclock_cost} seconds (wallclock time) elapsed")
 
     @logger.catch
-    def run(self, fevals=None, brackets=None, total_cost=None, single_node_with_gpus=False,
+    def run(self, fevals=None, brackets=None, total_cost=None, total_wallclock_cost=None,  single_node_with_gpus=False,
             verbose=False, debug=False, save_intermediate=True, save_history=True, **kwargs):
         """ Main interface to run optimization by DEHB
 
@@ -557,11 +579,12 @@ class MOHB:
         is complete, fetches the results, carries the necessary processing of it asynchronously
         to the worker computations.
 
-        The duration of the DEHB run can be controlled by specifying one of 3 parameters. If more
-        than one are specified, DEHB selects only one in the priority order (high to low):
+        The duration of the DEHB run can be controlled by specifying one of 4 parameters.
+        MODIFIED: If a defined limit is reached, the run will be stopped.
         1) Number of function evaluations (fevals)
         2) Number of Successive Halving brackets run under Hyperband (brackets)
-        3) Total computational cost (in seconds) aggregated by all function evaluations (total_cost)
+        3) Total computational cost (in seconds) aggregated by all function evaluations (total_wallclock_cost)
+        4) Total computational cost (in seconds) returned by the objective function. Might be simulated costs. (total_cost)
         """
         # checks if a Dask client exists
         if len(kwargs) > 0 and self.n_workers > 1 and isinstance(self.client, Client):
@@ -585,7 +608,7 @@ class MOHB:
         if debug:
             logger.configure(handlers=[{"sink": sys.stdout}])
         while True:
-            if self._is_run_budget_exhausted(fevals, brackets, total_cost):
+            if self._is_run_budget_exhausted(fevals, brackets, total_cost, total_wallclock_cost):
                 break
             if self.is_worker_available():
                 job_info = self._get_next_job()
@@ -607,7 +630,7 @@ class MOHB:
                     self.submit_job(job_info, **kwargs)
                     if verbose:
                         budget = job_info['budget']
-                        self._verbosity_runtime(fevals, brackets, total_cost)
+                        self._verbosity_runtime(fevals, brackets, total_cost, total_wallclock_cost)
                         self.logger.info(
                             "Evaluating a configuration with budget {} under "
                             "bracket ID {}".format(budget, job_info['bracket_id'])

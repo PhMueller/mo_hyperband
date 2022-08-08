@@ -1,13 +1,5 @@
 import numpy as np
-import sys
 from loguru import logger
-
-logger.configure(handlers=[{"sink": sys.stdout, "level": "INFO"}])
-_logger_props = {
-    "format": "{time} {level} {message}",
-    "enqueue": True,
-    "rotation": "500 MB"
-}
 
 scalarization_strategy = ["random_weights", "parego", "golovin"]
 
